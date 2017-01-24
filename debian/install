@@ -1,0 +1,2 @@
+secure-boot-code-sign usr/bin
+secure-boot-code-sign.conf etc/dsigning-box

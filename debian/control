@@ -1,0 +1,16 @@
+Source: dsigning-box
+Section: misc
+Priority: optional
+Maintainer: Helen Koike <helen.koike@collabora.com>
+Build-Depends: debhelper (>=9)
+Standards-Version: 3.9.7
+
+Package: dsigning-box
+Architecture: all
+Depends: pesign,
+         expect,
+         xz-utils,
+         ${misc:Depends}
+Description: Debian signing box scripts
+ This is a collection of scripts used by the Debian
+ project meant for signing and accessing tokens

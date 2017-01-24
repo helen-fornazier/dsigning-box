@@ -1,0 +1,116 @@
+#!/bin/bash
+
+set -u
+set -e
+set -o pipefail
+
+config_file="/etc/dsigning-box/secure-boot-code-sign.conf"
+
+if [ $# -lt 1 ]; then
+       echo "Usage: $0 <file.tar.xz>"
+       echo ""
+       echo "This script signs all the files in tarball file.tar.xz,"
+       echo "where file.tar.xz must be in IMG_DIR."
+       echo "The output will be placed at SIG_DIR."
+       echo ""
+       echo "Please, check $config_file"
+       exit 1
+fi
+
+# This script signs all the files in a tarball placed in IMG_DIR
+# and print the location of the result
+# Prevent any possible output to stdout, redirect them to stderr instead
+# Save STDOUT in fd_stdout
+exec {fd_stdout}>&1
+# Redirect STDOUT to STDERR
+exec 1>&2
+
+input_file="$1"
+
+error() {
+	echo >&2 "E: $*"
+	exit 1
+}
+
+# Read and trivially validate our configuration
+. "$config_file"
+for var in IMG_DIR SIG_DIR \
+		EFI_CERT_DIR EFI_CERT_NAME EFI_TOKEN_NAME \
+		LINUX_SIGNFILE LINUX_MODULES_PRIVKEY LINUX_MODULES_CERT; do
+	test -v "$var" || error "$var is not defined in configuration"
+	test -n "${!var}" || error "$var is empty in configuration"
+done
+# these variables are optional, set it to empty string to avoid unbound variable error
+EFI_SIGN_PIN=${EFI_SIGN_PIN-''}
+LINUX_SIGN_PIN=${LINUX_SIGN_PIN-''}
+
+# If we fail somewhere, cleanup the temporary directories
+in_dir=
+out_dir=
+cleanup() {
+	for dir in "$in_dir" "$out_dir" ; do
+		test -z "$dir" || rm -rf "$dir"
+	done
+}
+trap cleanup EXIT
+
+# Extract the data from IMG_DIR into a temporary directory
+in_dir="$(mktemp -td secure-boot-code-sign-in.XXXXXX)"
+tar xaf "$IMG_DIR/$input_file" --directory="$in_dir"
+
+# Create hierarchy of detached signatures in parallel to the uploaded files
+out_dir="$(mktemp -td secure-boot-code-sign-out.XXXXXX)"
+
+while read filename; do
+	# Skip changelog
+	if [ "$filename" == changelog ]; then
+		continue
+	fi
+	mkdir -p "$out_dir/${filename%/*}"
+	case "${filename##*/}" in
+	    *.efi | vmlinuz-*)
+		expect <<- EOF
+			log_user 0
+			spawn pesign -i "${in_dir}/${filename}" --export-signature "${out_dir}/${filename}.sig" \
+				--sign -d sha256 -n "${EFI_CERT_DIR}" -c "${EFI_CERT_NAME}" -t "${EFI_TOKEN_NAME}"
+			expect {
+				"Enter Password *:" {send "${EFI_SIGN_PIN}\r"; exp_continue}
+				"Enter passphrase *:" {send "${EFI_SIGN_PIN}\r"; exp_continue}
+				timeout {exit 1}
+				eof
+			}
+			lassign [wait] wait_pid spawn_id exec_rc wait_code
+			if {\$exec_rc != 0} {exit 1}
+			exit \$wait_code
+		EOF
+		;;
+	    *.ko)
+		 KBUILD_SIGN_PIN="$LINUX_SIGN_PIN" "$LINUX_SIGNFILE" -d sha256 "$LINUX_MODULES_PRIVKEY" \
+			"$LINUX_MODULES_CERT" "$in_dir/$filename"
+		mv "$in_dir/$filename.p7s" "$out_dir/$filename.sig"
+		;;
+	    *)
+		echo >&2 "W: Not signing unrecognised file: $filename"
+		continue
+		;;
+	esac
+	if [ "${#filename}" -gt 60 ]; then
+		filename_trunc="...${filename:$((${#filename} - 57)):57}"
+	else
+		filename_trunc="$filename"
+	fi
+	printf 'I: Signed %-60s\r' "$filename_trunc"
+done < <(find "$in_dir" -type f -printf '%P\n')
+
+# Clear last progress message
+printf '%-70s\r' ''
+
+# Build tarball of signatures
+chmod -R a+rX "$out_dir"
+mkdir -p "$SIG_DIR"
+tar caf "$SIG_DIR/sig-$input_file" --directory="$out_dir" .
+
+# Restore STDOUT from fd_stdout
+exec 1>&"$fd_stdout"
+
+echo "$SIG_DIR/sig-$input_file"
